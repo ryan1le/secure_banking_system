@@ -1,14 +1,24 @@
+import base64
+import hashlib
+import os
+import threading
+import time
 import PySimpleGUI as sg
 import socket
 import json
+import hmac
 from cryptography.fernet import Fernet
+from Crypto.Cipher import AES
 from datetime import datetime
+from helpers import *
 
 # Configuration
 HOST = 'localhost'
 PORT = 9999
 PRE_SHARED_KEY = b'2ZOxp2vxL4fYd7e8NlqQZ7W9mF1J3K6gR0sT4V2CJ5M='
 cipher_suite = Fernet(PRE_SHARED_KEY)
+
+XPRE_SHARED_KEY = base64.b64decode('2ZOxp2vxL4fYd7e8NlqQZ7W9mF1J3K6gR0sT4V2CJ5M=')
 
 # Theme and Colors
 sg.theme('DarkBlue3')
@@ -17,21 +27,162 @@ BUTTON_FONT = ('Helvetica', 12)
 TEXT_FONT = ('Helvetica', 12)
 INPUT_SIZE = (25, 1)
 
+class ConnectionManager:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.socket = None
+        self.connected = False
+
+    def get_connection(self):
+        with self.lock:
+            if not self.connected:
+                try:
+                    self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    self.socket.connect((HOST, PORT))
+                    self.connected = True
+                    print("Established persistent connection")
+                except Exception as e:
+                    raise ConnectionError(f"Connection failed: {str(e)}")
+            return self.socket
+
+    def close(self):
+        with self.lock:
+            if self.socket:
+                try:
+                    self.socket.close()
+                except:
+                    pass
+                self.connected = False
+                print("Closed persistent connection")
+
+con_manager = ConnectionManager()
+master_secret = None
+master_key = None
+hmac_key = None
+past_nonces = set()
+
+def generate_nonce():
+    nonce = os.urandom(16).hex()
+    while nonce in past_nonces:
+        nonce = os.urandom(16).hex()
+
+    past_nonces.add(nonce)
+    return nonce
+
+def exchange_keys():
+    global master_key, hmac_key
+    try:
+        client = con_manager.get_connection()
+
+        N0 = generate_nonce()
+        TS0 = str(time.time())
+        initial_message = json.dumps({"message": "Initial Message", "client_n": N0, "timestamp": TS0})
+        print("Initial Message to send:", initial_message)
+        
+        enc_initial_message = AESEncryption(XPRE_SHARED_KEY, initial_message)
+        print("Encrypted initial message:", enc_initial_message)
+        client.sendall(enc_initial_message.encode())
+
+        response = client.recv(4096).decode()
+        print("Received response: ", response)
+        dec_response = json.loads(AESDecryption(XPRE_SHARED_KEY ,response))
+        if (dec_response["client_n"] != N0 or dec_response["server_n"] in past_nonces or time.time() - float(dec_response["timestamp"]) > 10):
+            print("Message Replay Attack!")
+            raise Exception("Message is tainted")
+        past_nonces.add(dec_response["server_n"])
+        print(dec_response)
+
+        N1 = generate_nonce()
+        TS1 = str(time.time())
+        auth_client_msg = json.dumps({"message": "Authenticate Client", "client_n": N1, "server_n": dec_response["server_n"], "timestamp": TS1})
+        print("Auth Client Message to send:", auth_client_msg)
+
+        enc_auth_client_msg = AESEncryption(XPRE_SHARED_KEY, auth_client_msg)
+        print("Encrypted Auth Client Message:", enc_auth_client_msg)
+        client.sendall(enc_auth_client_msg.encode())
+
+        response = client.recv(4096).decode()
+        print("Received response: ", response)
+        dec_response = json.loads(AESDecryption(XPRE_SHARED_KEY ,response))
+        if (dec_response["client_n"] != N1 or dec_response["server_n"] in past_nonces or time.time() - float(dec_response["timestamp"]) > 10):
+            print("Message Replay Attack!")
+            raise Exception("Message is tainted")
+        past_nonces.add(dec_response["server_n"])
+        print(dec_response)
+
+        master_secret = bytes.fromhex(dec_response["master_secret"])
+        print("\nCreating MASTER and MAC keys")
+        master_key, hmac_key = derive_keys(master_secret)
+
+        N2 = generate_nonce()
+        TS2 = str(time.time())
+        verify_client_msg = json.dumps({"message": "Verify Master Key Client", "client_n": N2, "server_n": dec_response["server_n"], "timestamp": TS2})
+        print("Verify Master Key Client Message to send:", verify_client_msg)
+
+        enc_verify_client_msg = AESEncryption(master_key, verify_client_msg)
+        print("Encrypted Verify Master Key Client Message:", enc_verify_client_msg)
+        client.sendall(enc_verify_client_msg.encode())
+
+        final_response = client.recv(4096).decode()
+        print("Received final verification response: ", final_response)
+        dec_final_response = json.loads(AESDecryption(master_key ,final_response))
+        if (dec_final_response["client_n"] != N2 or dec_final_response["server_n"] in past_nonces or time.time() - float(dec_final_response["timestamp"]) > 10):
+            print("Message Replay Attack!")
+            raise Exception("Message is tainted")
+        past_nonces.add(dec_final_response["server_n"])
+        print(dec_final_response)
+
+        print("Initial exchange complete!")
+    except Exception as e:
+        print(e)
+        raise e
+
 def send_to_server(message):
     """Handle server communication"""
+    global master_key, hmac_key
     try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.settimeout(5)
-            s.connect((HOST, PORT))
-            s.send(message.encode())
-            return s.recv(1024)
+        client = con_manager.get_connection()
+        
+        sent_nonce = generate_nonce()
+        send_ts = str(time.time())
+        build_message = json.dumps({"message": message, "nonce": sent_nonce, "timestamp": send_ts})
+        print("Message to send", build_message)
+        enc_build_message =  AESEncryption(master_key, build_message).encode()
+
+        hmac_build_message = hmac.new(hmac_key, enc_build_message, hashlib.sha256).hexdigest().encode()
+        print(f"HMAC: {hmac_build_message}")
+
+        final_enc_message = enc_build_message + b"||" + hmac_build_message
+
+        print("Sending message")
+        client.sendall(final_enc_message)
+
+        print("Waiting for response")
+        response_enc, response_hmac = client.recv(4096).split(b"||")
+        response_verify_hmac = hmac.new(hmac_key, response_enc, hashlib.sha256).hexdigest().encode()
+
+        print("Verifying response")
+        if response_verify_hmac != response_hmac:
+            raise RuntimeError("Mismatched HMAC in response message")
+        
+        response = json.loads(AESDecryption(master_key, response_enc.decode()))
+        
+        if response["nonce"] in past_nonces:
+            raise RuntimeError("Replayed nonce detected!")
+        past_nonces.add(response["nonce"])
+        
+        if abs(float(response["timestamp"]) - float(send_ts)) > 10:
+            raise RuntimeError("Replayed timestamp detected!")
+
+        return response["message"]
+
     except ConnectionRefusedError:
         sg.popup_error("Server offline!\nStart the server first.")
     except Exception as e:
         sg.popup_error(f"Connection error: {str(e)}")
     return None
 
-def admin_panel(username):
+def admin_panel(username, audit_logs):
     """Admin Dashboard"""
     menu_def = [['Tools', ['User Management', 'Audit Logs']],
                 ['Help', ['About']]]
@@ -52,7 +203,8 @@ def admin_panel(username):
 
     audit_log_column = [
         [sg.Text("AUDIT LOGS", font=('Helvetica', 14))],
-        [sg.Multiline(default_text='', size=(60, 15), autoscroll=True, disabled=True)]
+        [sg.Multiline(default_text=audit_logs, size=(60, 15), autoscroll=True, disabled=True, key='-LOGS-')],
+        [sg.Button('Refresh_Logs'), sg.Button('Logout')]
     ]
 
     layout = [
@@ -70,7 +222,7 @@ def admin_panel(username):
         if not admin_password:
             return
         
-        response = send_to_server(f'admin:list_users:{username}:{admin_password}')
+        response = send_to_server(f'admin:list_users:{username}:{admin_password}').encode()
         if response == b'ADMIN_DENIED':
             window['-STATUS-'].update("Authorization failed!")
         elif response:
@@ -84,6 +236,16 @@ def admin_panel(username):
                 window['-STATUS-'].update(f"Loaded {len(users)} users")
             except Exception as e:
                 window['-STATUS-'].update(f"Error: {str(e)}")
+    
+    def refresh_logs():
+        try:
+            response = send_to_server('update:logs')
+            test = '\n'.join(json.dumps(x) for x in response)
+            window['-LOGS-'].update(test)
+
+        except Exception as e:
+            sg.popup_error(f"Connection error: {str(e)}")
+
 
     while True:
         event, values = window.read()
@@ -94,6 +256,8 @@ def admin_panel(username):
             refresh_users()
         elif event == 'Refresh':
             refresh_users()
+        elif event == 'Refresh_Logs':
+            refresh_logs()
         elif event == '-USER-TABLE-':  
             col_clicked = values[event][1]
             user_data = window['-USER-TABLE-'].get()
@@ -140,7 +304,7 @@ def main_window():
             
         if event == 'Register':
             window['-STATUS-'].update("Processing registration...")
-            response = send_to_server(f'register:{username}:{password}')
+            response = send_to_server(f'register:{username}:{password}').encode()
             if response == b'REGISTER_SUCCESS':
                 sg.popup_ok("Account Created!\nYou can now login.", title="Success")
                 window['-STATUS-'].update("")
@@ -151,36 +315,33 @@ def main_window():
                 
         elif event == 'Login':
             window['-STATUS-'].update("Authenticating...")
-            response = send_to_server(f'login:{username}:{password}')
+            response = send_to_server(f'login:{username}:{password}').encode()
             if response == b'LOGIN_FAILED':
                 window['-STATUS-'].update("Invalid credentials!")
             elif response:
                 try:
-                    cipher_suite.decrypt(response)
                     window.close()
                     if username == "admin":
-                        admin_panel(username)
+                        admin_panel(username, '')
                     else:
-                        user_dashboard(username)
+                        response = json.loads(response.decode())
+                        user_dashboard(username, response, [])
                 except:
                     window['-STATUS-'].update("Authentication failed!")
 
     window.close()
 
-def user_dashboard(username):
+def user_dashboard(username, user_data, log_entry):
     """User Dashboard"""
     account_summary = [
         [sg.Text("Account Summary", font=HEADER_FONT)],
         [sg.HorizontalSeparator()],
         [sg.Text("Current Balance:", font=TEXT_FONT), 
-         sg.Text("$12,345.67", font=('Helvetica', 18), key='-BALANCE-')]
+         sg.Text(user_data["balance"], font=('Helvetica', 18), key='-BALANCE-')]
     ]
 
     transaction_history = [
-        [sg.Table(values=[
-            ["2023-01-01", "Deposit", "$1,000.00"],
-            ["2023-01-02", "Withdrawal", "$200.00"]
-        ], headings=['Date', 'Type', 'Amount'], 
+        [sg.Table(values=log_entry, headings=['Date', 'Type', 'Amount'], 
         key='-TRANSACTIONS-',
         auto_size_columns=False,
         col_widths=[12, 12, 12],
@@ -199,8 +360,7 @@ def user_dashboard(username):
          key='-AMOUNT-', 
          tooltip="Enter transaction amount")],
         [sg.Button('Deposit', button_color=('white', '#2ECC71')),
-         sg.Button('Withdraw', button_color=('white', '#E74C3C')),
-         sg.Button('Balance', button_color=('white', '#3498DB'))],
+         sg.Button('Withdraw', button_color=('white', '#E74C3C'))],
         [sg.Button('Logout', expand_x=True)]
     ]
 
@@ -234,11 +394,13 @@ def user_dashboard(username):
             # Here you would typically send to server
             transaction_type = "Deposit" if event == 'Deposit' else "Withdrawal"
             sg.popup_quick(f"Processing {transaction_type} of ${amount:.2f}")
-
-            # Update balance (simulated - replace with actual server communication)
-            current_balance = float(window['-BALANCE-'].get().replace('$','').replace(',',''))
-            new_balance = current_balance + (amount if event == 'Deposit' else -amount)
+            
+            response = json.loads(send_to_server(json.dumps({"username": username, "action": transaction_type, "amount": amount})))
+            new_balance = response["balance"]
             window['-BALANCE-'].update(f"${new_balance:,.2f}")
+
+            log_entry.append([datetime.now().strftime('%Y-%m-%d %H:%M:%S'), transaction_type, amount])
+            window['-TRANSACTIONS-'].update(log_entry)
 
             # Clear input field after transaction
             window['-AMOUNT-'].update('')
@@ -247,4 +409,5 @@ def user_dashboard(username):
     main_window()
 
 if __name__ == '__main__':
+    exchange_keys()
     main_window()

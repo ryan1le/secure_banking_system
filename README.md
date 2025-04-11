@@ -8,11 +8,15 @@ Abel -
 - user.enc
 
 Mathsru -
-- COE817FInalProjectPart2.py
+- helpers.py
 
 Dylan -
 - transaction_protocol.py
 - audit.log
+
+Ryan -
+- atm_client.py
+- bank_server.py
 
 ---
 

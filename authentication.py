@@ -54,39 +54,64 @@ class UserAuthentication:
         with open("users.enc", "wb") as f:
             f.write(encrypted_data)
 
-    def register(self, data, client_socket):
-            _, username, password = data.split(':', 2)
-            username = username.strip()
+    def register(self, data, transaction_handler):
+        _, username, password = data.split(':', 2)
+        username = username.strip()
+        
+        if not username or not password:
+            return 'EMPTY_FIELDS'
             
-            if not username or not password:
-                client_socket.send(b'EMPTY_FIELDS')
-                return
-                
-            if username in self.users:
-                client_socket.send(b'USER_EXISTS')
-                return
-                
-            hashed_pw = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
-            self.users[username] = {
-                "password": hashed_pw,
-                "is_admin": False,
-                "created_at": datetime.now().isoformat()
-            }
-            self.save_users()
-            client_socket.send(b'REGISTER_SUCCESS')
+        if username in self.users:
+            return 'USER_EXISTS'
+            
+        hashed_pw = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+        self.users[username] = {
+            "password": hashed_pw,
+            "is_admin": False,
+            "created_at": datetime.now().isoformat(),
+            "balance": 0.00
+        }
+        self.save_users()
+        transaction_handler._log_transaction({"customer_id": username, "action": "Register"})
+        return 'REGISTER_SUCCESS'
+    
+    def update_balance(self, data, transaction_handler):
+        username = data["username"]
+        action = data["action"]
+        amount = data["amount"]
 
-    def login(self, data, client_socket):
+        if not username:
+            return 'EMPTY_FIELDS'
+                
+        if username not in self.users:
+            return 'USER_DOESNT_EXISTS'
+               
+        client = self.users[username]
+        
+        current_balance = client["balance"]
+
+        new_balance = current_balance + (amount if action == 'Deposit' else -amount)
+        client["balance"] = new_balance
+
+        transaction_handler._log_transaction({"customer_id": username, "action": action, "amount": amount})
+        return json.dumps(client)
+
+    def login(self, data, transaction_handler):
             _, username, password = data.split(':', 2)
             user_data = self.users.get(username.strip(), None)
+
+            if (username.strip() == 'admin'):
+                if user_data and bcrypt.checkpw(password.encode(), user_data['password'].encode()):
+                    return 'Hello'
             
             if user_data and bcrypt.checkpw(password.encode(), user_data['password'].encode()):
-                master_secret = Fernet.generate_key()
-                encrypted_secret = self.cipher_suite.encrypt(master_secret)
-                client_socket.send(encrypted_secret)
+                transaction_handler._log_transaction({"customer_id": username, "action": "Login"})
+                transaction_handler._log_transaction({"customer_id": username, "action": "Balance", "amount": user_data["balance"]})
+                return json.dumps(user_data)
             else:
-                client_socket.send(b'LOGIN_FAILED')
+                return 'LOGIN_FAILED'
 
-    def adminCheck(self, data, client_socket):
+    def adminCheck(self, data):
             try:
                 # Split into 4 parts: 'admin', command_type, username, password
                 _, cmd_type, username, password = data.split(':', 3)
@@ -97,25 +122,23 @@ class UserAuthentication:
                 
                 # Verify admin status and password
                 if not user_data.get('is_admin', False):
-                    client_socket.send(b'ADMIN_DENIED')
-                    return
+                    return 'ADMIN_DENIED'
                     
                 if not bcrypt.checkpw(password.encode(), user_data['password'].encode()):
-                    client_socket.send(b'ADMIN_DENIED')
-                    return
+                    return 'ADMIN_DENIED'
   
                 if cmd_type == 'list_users':
                     user_list = [{
                         'username': uname,
                         'created_at': data['created_at']
                     } for uname, data in self.users.items()]
-                    client_socket.send(json.dumps(user_list).encode())
+                    return (json.dumps(user_list))
                     
                 else:
-                    client_socket.send(b'INVALID_CMD')
+                    return 'INVALID_CMD'
 
             except ValueError:
-                client_socket.send(b'INVALID_FORMAT')
+                return 'INVALID_FORMAT'
 
     
 
